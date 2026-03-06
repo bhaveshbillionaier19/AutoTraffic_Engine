@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <unistd.h>
-
+#include <arpa/inet.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
@@ -15,53 +15,56 @@ static void sig_handler(int sig)
     exiting = 1;
 }
 
-static int handle_event(void *ctx, void *data, size_t len)
+void print_ip(__u32 ip)
 {
-    struct telemetry_event *e = data;
-
-    printf("Packet received | len=%u | ifindex=%u | time=%llu\n",
-           e->pkt_len,
-           e->ifindex,
-           e->timestamp);
-
-    return 0;
+    struct in_addr addr;
+    addr.s_addr = ip;   
+    printf("%s", inet_ntoa(addr));
 }
 
 int main()
 {
-    struct ring_buffer *rb = NULL;
     int map_fd;
-    int err;
+    struct flow_id key, next_key;
+    struct flow_stats stats;
 
     signal(SIGINT, sig_handler);
 
-    /* Open the pinned ring buffer map */
+    map_fd = bpf_obj_get("/sys/fs/bpf/tc/globals/flow_table");
 
-    map_fd = bpf_obj_get("/sys/fs/bpf/tc/globals/events");
     if (map_fd < 0) {
-        printf("Failed to open pinned map\n");
+        printf("Failed to open flow_table map\n");
         return 1;
     }
 
-    /* Create ring buffer listener */
-
-    rb = ring_buffer__new(map_fd, handle_event, NULL, NULL);
-    if (!rb) {
-        printf("Failed to create ring buffer\n");
-        return 1;
-    }
-
-    printf("Listening for telemetry events...\n");
+    printf("Reading flow telemetry...\n");
 
     while (!exiting) {
-        err = ring_buffer__poll(rb, 100);
-        if (err < 0) {
-            printf("Error polling ring buffer\n");
-            break;
+        if (bpf_map_get_next_key(map_fd, NULL, &next_key) != 0) {
+            sleep(1);
+            continue;
         }
-    }
+        do {
+            if (bpf_map_lookup_elem(map_fd, &next_key, &stats) == 0) {
 
-    ring_buffer__free(rb);
+                printf("\nFlow: ");
+
+                print_ip(next_key.src_ip);
+                printf(":%d -> ", ntohs(next_key.src_port));
+
+                print_ip(next_key.dst_ip);
+                printf(":%d ", ntohs(next_key.dst_port));
+
+                printf("\nPackets: %llu", stats.packets);
+                printf("\nBytes  : %llu\n", stats.bytes);
+            }
+
+            key = next_key;
+
+        } while (bpf_map_get_next_key(map_fd, &key, &next_key) == 0);
+
+        sleep(1);
+    }
 
     return 0;
 }
